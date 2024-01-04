@@ -3,38 +3,32 @@ package mixed
 import (
 	"bufio"
 	"context"
+	"net"
+
 	"github.com/bepass-org/proxy/pkg/http"
 	"github.com/bepass-org/proxy/pkg/socks4"
 	"github.com/bepass-org/proxy/pkg/socks5"
 	"github.com/bepass-org/proxy/pkg/statute"
-	"net"
 )
 
+// userHandler is a function type for handling proxy requests.
 type userHandler func(request *statute.ProxyRequest) error
 
+// Proxy is a multiprotocol proxy server.
 type Proxy struct {
-	// bind is the address to listen on
-	bind string
-	// socks5Proxy is a socks5 server with tcp and udp support
-	socks5Proxy *socks5.Server
-	// socks4Proxy is a socks4 server with tcp support
-	socks4Proxy *socks4.Server
-	// httpProxy is a http proxy server with http and http-connect support
-	httpProxy *http.Server
-	// userConnectHandle is a user handler for tcp and udp requests(its general handler)
-	userHandler userHandler
-	// if user doesnt set userHandler, it can specify userTCPHandler for manual handling of tcp requests
-	userTCPHandler userHandler
-	// if user doesnt set userHandler, it can specify userUDPHandler for manual handling of udp requests
-	userUDPHandler userHandler
-	// overwrite dial functions of http, socks4, socks5
-	userDialFunc statute.ProxyDialFunc
-	// logger error log
-	logger statute.Logger
-	// ctx is default context
-	ctx context.Context
+	bind           string                // Address to listen on
+	socks5Proxy    *socks5.Server        // SOCKS5 server with TCP and UDP support
+	socks4Proxy    *socks4.Server        // SOCKS4 server with TCP support
+	httpProxy      *http.Server          // HTTP proxy server with HTTP and HTTP-connect support
+	userHandler    userHandler           // General handler for TCP and UDP requests
+	userTCPHandler userHandler           // User-defined handler for TCP requests
+	userUDPHandler userHandler           // User-defined handler for UDP requests
+	userDialFunc   statute.ProxyDialFunc // User-defined dial function
+	logger         statute.Logger        // Logger for error logs
+	ctx            context.Context       // Default context
 }
 
+// NewProxy creates a new multiprotocol proxy server with options.
 func NewProxy(options ...Option) *Proxy {
 	p := &Proxy{
 		bind:         statute.DefaultBindAddress,
@@ -53,15 +47,16 @@ func NewProxy(options ...Option) *Proxy {
 	return p
 }
 
+// Option is a function type for configuring the Proxy.
 type Option func(*Proxy)
 
-// SwitchConn wraps a net.Conn and a bufio.Reader
+// SwitchConn wraps a net.Conn and a bufio.Reader.
 type SwitchConn struct {
 	net.Conn
 	reader *bufio.Reader
 }
 
-// NewSwitchConn creates a new SwitchConn
+// NewSwitchConn creates a new SwitchConn.
 func NewSwitchConn(conn net.Conn) *SwitchConn {
 	return &SwitchConn{
 		Conn:   conn,
@@ -69,30 +64,26 @@ func NewSwitchConn(conn net.Conn) *SwitchConn {
 	}
 }
 
-// Read reads data into p, first from the bufio.Reader, then from the net.Conn
+// Read reads data into p, first from the bufio.Reader, then from the net.Conn.
 func (c *SwitchConn) Read(p []byte) (n int, err error) {
 	return c.reader.Read(p)
 }
 
+// ListenAndServe starts the proxy server and begins listening for incoming connections.
 func (p *Proxy) ListenAndServe() error {
 	p.logger.Debug("Serving on " + p.bind + " ...")
-	// Create a new listener
 	ln, err := net.Listen("tcp", p.bind)
 	if err != nil {
 		p.logger.Error("Error listening on " + p.bind + ", " + err.Error())
-		return err // Return error if binding was unsuccessful
+		return err
 	}
-
-	// ensure listener will be closed
 	defer func() {
 		_ = ln.Close()
 	}()
 
-	// Create a cancelable context based on p.Context
 	ctx, cancel := context.WithCancel(p.ctx)
-	defer cancel() // Ensure resources are cleaned up
+	defer cancel()
 
-	// Start to accept connections and serve them
 	for {
 		select {
 		case <-ctx.Done():
@@ -104,30 +95,26 @@ func (p *Proxy) ListenAndServe() error {
 				continue
 			}
 
-			// Start a new goroutine to handle each connection
-			// This way, the server can handle multiple connections concurrently
 			go func() {
 				err := p.handleConnection(conn)
 				if err != nil {
-					p.logger.Error(err) // Log errors from ServeConn
+					p.logger.Error(err)
 				}
 			}()
 		}
 	}
 }
 
+// handleConnection handles incoming connections and routes them based on the detected protocol.
 func (p *Proxy) handleConnection(conn net.Conn) error {
-	// Create a SwitchConn
 	switchConn := NewSwitchConn(conn)
-
-	// Read one byte to determine the protocol
 	buf := make([]byte, 1)
+
 	_, err := switchConn.Read(buf)
 	if err != nil {
 		return err
 	}
 
-	// Unread the byte so it's available for the next read
 	err = switchConn.reader.UnreadByte()
 	if err != nil {
 		return err

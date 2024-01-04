@@ -4,9 +4,10 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"github.com/bepass-org/proxy/pkg/statute"
 	"io"
 	"net"
+
+	"github.com/bepass-org/proxy/pkg/statute"
 )
 
 // Server is accepting connections and handling the details of the SOCKS5 protocol

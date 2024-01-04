@@ -10,7 +10,7 @@ import (
 	"strings"
 )
 
-// isClosedConnError reports whether err is an error from use of a closed
+// isClosedConnError reports whether err is an error from the use of a closed
 // network connection.
 func isClosedConnError(err error) bool {
 	if err == nil {
@@ -36,6 +36,7 @@ func isClosedConnError(err error) bool {
 	return false
 }
 
+// errno extracts the numeric value from an error.
 func errno(v error) uintptr {
 	if rv := reflect.ValueOf(v); rv.Kind() == reflect.Uintptr {
 		return uintptr(rv.Uint())
@@ -43,30 +44,44 @@ func errno(v error) uintptr {
 	return 0
 }
 
-// Tunnel create tunnels for two io.ReadWriteCloser
-func Tunnel(ctx context.Context, c1, c2 io.ReadWriteCloser, buf1, buf2 []byte) error {
-	ctx, cancel := context.WithCancel(ctx)
+// Tunnel creates bidirectional tunnels between two io.ReadWriteCloser instances.
+func Tunnel(ctx context.Context, source, destination io.ReadWriteCloser, sourceBuffer, destinationBuffer []byte) error {
 	var errs tunnelErr
+
+	// Use the provided context directly
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	go func() {
-		_, errs[0] = io.CopyBuffer(c1, c2, buf1)
+		_, errs[0] = io.CopyBuffer(source, destination, sourceBuffer)
 		cancel()
 	}()
+
 	go func() {
-		_, errs[1] = io.CopyBuffer(c2, c1, buf2)
+		_, errs[1] = io.CopyBuffer(destination, source, destinationBuffer)
 		cancel()
 	}()
+
 	<-ctx.Done()
-	errs[2] = c1.Close()
-	errs[3] = c2.Close()
+
+	// Close both source and destination, and check for errors
+	errs[2] = source.Close()
+	errs[3] = destination.Close()
 	errs[4] = ctx.Err()
+
+	// If the context was canceled, set it to nil in the error slice
 	if errs[4] == context.Canceled {
 		errs[4] = nil
 	}
+
+	// Return the first non-nil error, ignoring closed connection errors
 	return errs.FirstError()
 }
 
+// tunnelErr is a type that aggregates multiple errors.
 type tunnelErr [5]error
 
+// FirstError returns the first non-nil error, ignoring closed connection errors.
 func (t tunnelErr) FirstError() error {
 	for _, err := range t {
 		if err != nil {

@@ -1,167 +1,242 @@
 package socks4
 
 import (
-	"bytes"
-	"encoding/binary"
+	"context"
+	"fmt"
 	"io"
 	"net"
-	"strconv"
+
+	"github.com/bepass-org/proxy/pkg/statute"
 )
 
-var (
-	isSocks4a = []byte{0, 0, 0, 1}
-	isNone    = []byte{0, 0, 0, 0}
-)
+// Server is accepting connections and handling the details of the SOCKS4 protocol
+type Server struct {
+	// bind is the address to listen on
+	Bind string
+	// ProxyDial specifies the optional proxyDial function for
+	// establishing the transport connection.
+	ProxyDial statute.ProxyDialFunc
+	// UserConnectHandle gives the user control to handle the TCP CONNECT requests
+	UserConnectHandle statute.UserConnectHandler
+	// Logger error log
+	Logger statute.Logger
+	// Context is default context
+	Context context.Context
+	// BytesPool getting and returning temporary bytes for use by io.CopyBuffer
+	BytesPool statute.BytesPool
+}
 
-const (
-	socks4Version = 0x04
-)
-
-const (
-	ConnectCommand Command = 0x01
-)
-
-// Command is a SOCKS Command.
-type Command byte
-
-func (cmd Command) String() string {
-	switch cmd {
-	case ConnectCommand:
-		return "socks connect"
-	default:
-		return "socks " + strconv.Itoa(int(cmd))
+func NewServer(options ...ServerOption) *Server {
+	s := &Server{
+		ProxyDial: statute.DefaultProxyDial(),
+		Logger:    statute.DefaultLogger{},
+		Context:   statute.DefaultContext(),
 	}
-}
 
-const (
-	grantedReply     reply = 0x5a
-	rejectedReply    reply = 0x5b
-	noIdentdReply    reply = 0x5c
-	invalidUserReply reply = 0x5d
-)
-
-// reply is a SOCKS Command reply code.
-type reply byte
-
-func (code reply) String() string {
-	switch code {
-	case grantedReply:
-		return "request granted"
-	case rejectedReply:
-		return "request rejected or failed"
-	case noIdentdReply:
-		return "request rejected becasue SOCKS server cannot connect to identd on the client"
-	case invalidUserReply:
-		return "request rejected because the client program and identd report different user-ids"
-	default:
-		return "unknown code: " + strconv.Itoa(int(code))
+	for _, option := range options {
+		option(s)
 	}
+
+	return s
 }
 
-// address is a SOCKS-specific address.
-// Either Name or IP is used exclusively.
-type address struct {
-	Name string // fully-qualified domain name
-	IP   net.IP
-	Port int
-}
+type ServerOption func(*Server)
 
-func (a *address) Network() string { return "socks4" }
-
-func (a *address) String() string {
-	if a == nil {
-		return "<nil>"
+func (s *Server) ListenAndServe() error {
+	s.Logger.Debug("Serving on " + s.Bind + " ...")
+	// Create a new listener
+	ln, err := net.Listen("tcp", s.Bind)
+	if err != nil {
+		s.Logger.Error("Error listening on " + s.Bind + ", " + err.Error())
+		return err // Return error if binding was unsuccessful
 	}
-	return a.Address()
-}
 
-// Address returns a string suitable to dial; prefer returning IP-based
-// address, fallback to Name
-func (a address) Address() string {
-	port := strconv.Itoa(a.Port)
-	if a.Name != "" {
-		return net.JoinHostPort(a.Name, port)
-	}
-	return net.JoinHostPort(a.IP.String(), port)
-}
+	// ensure listener will be closed
+	defer func() {
+		_ = ln.Close()
+	}()
 
-type AddrAnfUser struct {
-	address
-	Username string
-}
+	// Create a cancelable context based on s.Context
+	ctx, cancel := context.WithCancel(s.Context)
+	defer cancel() // Ensure resources are cleaned up
 
-func readBytes(r io.Reader) ([]byte, error) {
-	buf := []byte{}
-	var data [1]byte
+	// Start to accept connections and serve them
 	for {
-		_, err := r.Read(data[:])
-		if err != nil {
-			return nil, err
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			conn, err := ln.Accept()
+			if err != nil {
+				s.Logger.Error(err)
+				continue
+			}
+
+			// Start a new goroutine to handle each connection
+			// This way, the server can handle multiple connections concurrently
+			go func() {
+				err := s.ServeConn(conn)
+				if err != nil {
+					s.Logger.Error(err) // Log errors from ServeConn
+				}
+			}()
 		}
-		if data[0] == 0 {
-			return buf, nil
-		}
-		buf = append(buf, data[0])
 	}
 }
 
-func readByte(r io.Reader) (byte, error) {
-	var buf [1]byte
-	_, err := r.Read(buf[:])
-	if err != nil {
-		return 0, err
+func WithLogger(logger statute.Logger) ServerOption {
+	return func(s *Server) {
+		s.Logger = logger
 	}
-	return buf[0], nil
 }
 
-func readAddrAndUser(r io.Reader) (*AddrAnfUser, error) {
-	address := &AddrAnfUser{}
-	var port [2]byte
-	if _, err := io.ReadFull(r, port[:]); err != nil {
-		return nil, err
+func WithBind(bindAddress string) ServerOption {
+	return func(s *Server) {
+		s.Bind = bindAddress
 	}
-	address.Port = int(binary.BigEndian.Uint16(port[:]))
-	ip := make(net.IP, net.IPv4len)
-	if _, err := io.ReadFull(r, ip); err != nil {
-		return nil, err
-	}
-	socks4a := bytes.Equal(ip, isSocks4a)
-
-	username, err := readBytes(r)
-	if err != nil {
-		return nil, err
-	}
-	address.Username = string(username)
-	if socks4a {
-		hostname, err := readBytes(r)
-		if err != nil {
-			return nil, err
-		}
-		address.Name = string(hostname)
-	} else {
-		address.IP = ip
-	}
-	return address, nil
 }
 
-func writeAddr(w io.Writer, addr *address) error {
-	var ip net.IP
-	var port uint16
-	if addr != nil {
-		ip = addr.IP.To4()
-		port = uint16(addr.Port)
+func WithConnectHandle(handler statute.UserConnectHandler) ServerOption {
+	return func(s *Server) {
+		s.UserConnectHandle = handler
 	}
-	var p [2]byte
-	binary.BigEndian.PutUint16(p[:], port)
-	_, err := w.Write(p[:])
+}
+
+func WithProxyDial(proxyDial statute.ProxyDialFunc) ServerOption {
+	return func(s *Server) {
+		s.ProxyDial = proxyDial
+	}
+}
+
+func WithContext(ctx context.Context) ServerOption {
+	return func(s *Server) {
+		s.Context = ctx
+	}
+}
+
+func WithBytesPool(bytesPool statute.BytesPool) ServerOption {
+	return func(s *Server) {
+		s.BytesPool = bytesPool
+	}
+}
+
+func (s *Server) ServeConn(conn net.Conn) error {
+	version, err := readByte(conn)
 	if err != nil {
 		return err
 	}
-
-	if ip == nil {
-		_, err = w.Write(isNone)
-	} else {
-		_, err = w.Write(ip)
+	if version != socks4Version {
+		return fmt.Errorf("unsupported SOCKS version: %d", version)
 	}
+	req := &request{
+		Version: socks4Version,
+		Conn:    conn,
+	}
+
+	cmd, err := readByte(conn)
+	if err != nil {
+		return err
+	}
+	req.Command = Command(cmd)
+
+	addr, err := readAddrAndUser(conn)
+	if err != nil {
+		if err := sendReply(req.Conn, rejectedReply, nil); err != nil {
+			return fmt.Errorf("failed to send reply: %v", err)
+		}
+		return err
+	}
+	req.DestinationAddr = &addr.address
+	req.Username = addr.Username
+	return s.handle(req)
+}
+
+func (s *Server) handle(req *request) error {
+	switch req.Command {
+	case ConnectCommand:
+		return s.handleConnect(req)
+	default:
+		if err := sendReply(req.Conn, rejectedReply, nil); err != nil {
+			return err
+		}
+		return fmt.Errorf("unsupported Command: %v", req.Command)
+	}
+}
+
+func (s *Server) handleConnect(req *request) error {
+	if s.UserConnectHandle == nil {
+		return s.embedHandleConnect(req)
+	}
+
+	if err := sendReply(req.Conn, grantedReply, nil); err != nil {
+		return fmt.Errorf("failed to send reply: %v", err)
+	}
+	host := req.DestinationAddr.IP.String()
+	if req.DestinationAddr.Name != "" {
+		host = req.DestinationAddr.Name
+	}
+
+	proxyReq := &statute.ProxyRequest{
+		Conn:        req.Conn,
+		Reader:      io.Reader(req.Conn),
+		Writer:      io.Writer(req.Conn),
+		Network:     "tcp",
+		Destination: req.DestinationAddr.String(),
+		DestHost:    host,
+		DestPort:    int32(req.DestinationAddr.Port),
+	}
+
+	return s.UserConnectHandle(proxyReq)
+}
+
+func (s *Server) embedHandleConnect(req *request) error {
+	defer func() {
+		_ = req.Conn.Close()
+	}()
+	target, err := s.ProxyDial(s.Context, "tcp", req.DestinationAddr.Address())
+	if err != nil {
+		if err := sendReply(req.Conn, rejectedReply, nil); err != nil {
+			return fmt.Errorf("failed to send reply: %v", err)
+		}
+		return fmt.Errorf("connect to %v failed: %w", req.DestinationAddr, err)
+	}
+	defer func() {
+		_ = target.Close()
+	}()
+	local := target.LocalAddr().(*net.TCPAddr)
+	bind := address{IP: local.IP, Port: local.Port}
+	if err := sendReply(req.Conn, grantedReply, &bind); err != nil {
+		return fmt.Errorf("failed to send reply: %v", err)
+	}
+
+	var buf1, buf2 []byte
+	if s.BytesPool != nil {
+		buf1 = s.BytesPool.Get()
+		buf2 = s.BytesPool.Get()
+		defer func() {
+			s.BytesPool.Put(buf1)
+			s.BytesPool.Put(buf2)
+		}()
+	} else {
+		buf1 = make([]byte, 32*1024)
+		buf2 = make([]byte, 32*1024)
+	}
+	return statute.Tunnel(s.Context, target, req.Conn, buf1, buf2)
+}
+
+func sendReply(w io.Writer, resp reply, addr *address) error {
+	_, err := w.Write([]byte{0, byte(resp)})
+	if err != nil {
+		return err
+	}
+	err = writeAddr(w, addr)
 	return err
+}
+
+type request struct {
+	Version         uint8
+	Command         Command
+	DestinationAddr *address
+	Username        string
+	Conn            net.Conn
 }

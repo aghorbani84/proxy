@@ -3,26 +3,20 @@ package socks4
 import (
 	"context"
 	"fmt"
-	"github.com/bepass-org/proxy/pkg/statute"
 	"io"
 	"net"
+
+	"github.com/bepass-org/proxy/pkg/statute"
 )
 
 // Server is accepting connections and handling the details of the SOCKS4 protocol
 type Server struct {
-	// bind is the address to listen on
-	Bind string
-	// ProxyDial specifies the optional proxyDial function for
-	// establishing the transport connection.
-	ProxyDial statute.ProxyDialFunc
-	// UserConnectHandle gives the user control to handle the TCP CONNECT requests
+	Bind              string
+	ProxyDial         statute.ProxyDialFunc
 	UserConnectHandle statute.UserConnectHandler
-	// Logger error log
-	Logger statute.Logger
-	// Context is default context
-	Context context.Context
-	// BytesPool getting and returning temporary bytes for use by io.CopyBuffer
-	BytesPool statute.BytesPool
+	Logger            statute.Logger
+	Context           context.Context
+	BytesPool         statute.BytesPool
 }
 
 func NewServer(options ...ServerOption) *Server {
@@ -39,27 +33,25 @@ func NewServer(options ...ServerOption) *Server {
 	return s
 }
 
+// ServerOption is a functional option for configuring the Server.
 type ServerOption func(*Server)
 
+// ListenAndServe starts accepting connections on the specified address.
 func (s *Server) ListenAndServe() error {
 	s.Logger.Debug("Serving on " + s.Bind + " ...")
-	// Create a new listener
+
 	ln, err := net.Listen("tcp", s.Bind)
 	if err != nil {
 		s.Logger.Error("Error listening on " + s.Bind + ", " + err.Error())
-		return err // Return error if binding was unsuccessful
+		return err
 	}
-
-	// ensure listener will be closed
 	defer func() {
 		_ = ln.Close()
 	}()
 
-	// Create a cancelable context based on s.Context
 	ctx, cancel := context.WithCancel(s.Context)
-	defer cancel() // Ensure resources are cleaned up
+	defer cancel()
 
-	// Start to accept connections and serve them
 	for {
 		select {
 		case <-ctx.Done():
@@ -71,54 +63,17 @@ func (s *Server) ListenAndServe() error {
 				continue
 			}
 
-			// Start a new goroutine to handle each connection
-			// This way, the server can handle multiple connections concurrently
 			go func() {
 				err := s.ServeConn(conn)
 				if err != nil {
-					s.Logger.Error(err) // Log errors from ServeConn
+					s.Logger.Error(err)
 				}
 			}()
 		}
 	}
 }
 
-func WithLogger(logger statute.Logger) ServerOption {
-	return func(s *Server) {
-		s.Logger = logger
-	}
-}
-
-func WithBind(bindAddress string) ServerOption {
-	return func(s *Server) {
-		s.Bind = bindAddress
-	}
-}
-
-func WithConnectHandle(handler statute.UserConnectHandler) ServerOption {
-	return func(s *Server) {
-		s.UserConnectHandle = handler
-	}
-}
-
-func WithProxyDial(proxyDial statute.ProxyDialFunc) ServerOption {
-	return func(s *Server) {
-		s.ProxyDial = proxyDial
-	}
-}
-
-func WithContext(ctx context.Context) ServerOption {
-	return func(s *Server) {
-		s.Context = ctx
-	}
-}
-
-func WithBytesPool(bytesPool statute.BytesPool) ServerOption {
-	return func(s *Server) {
-		s.BytesPool = bytesPool
-	}
-}
-
+// ServeConn handles the SOCKS4 protocol for a single connection.
 func (s *Server) ServeConn(conn net.Conn) error {
 	version, err := readByte(conn)
 	if err != nil {
@@ -127,6 +82,7 @@ func (s *Server) ServeConn(conn net.Conn) error {
 	if version != socks4Version {
 		return fmt.Errorf("unsupported SOCKS version: %d", version)
 	}
+
 	req := &request{
 		Version: socks4Version,
 		Conn:    conn,
@@ -150,6 +106,51 @@ func (s *Server) ServeConn(conn net.Conn) error {
 	return s.handle(req)
 }
 
+// ServerOption functions for configuring the Server.
+
+// WithLogger sets the logger for the Server.
+func WithLogger(logger statute.Logger) ServerOption {
+	return func(s *Server) {
+		s.Logger = logger
+	}
+}
+
+// WithBind sets the address to listen on for the Server.
+func WithBind(bindAddress string) ServerOption {
+	return func(s *Server) {
+		s.Bind = bindAddress
+	}
+}
+
+// WithConnectHandle sets the user handler for handling TCP CONNECT requests.
+func WithConnectHandle(handler statute.UserConnectHandler) ServerOption {
+	return func(s *Server) {
+		s.UserConnectHandle = handler
+	}
+}
+
+// WithProxyDial sets the proxyDial function for establishing transport connections.
+func WithProxyDial(proxyDial statute.ProxyDialFunc) ServerOption {
+	return func(s *Server) {
+		s.ProxyDial = proxyDial
+	}
+}
+
+// WithContext sets the default context for the Server.
+func WithContext(ctx context.Context) ServerOption {
+	return func(s *Server) {
+		s.Context = ctx
+	}
+}
+
+// WithBytesPool sets the bytes pool for temporary buffers used by io.CopyBuffer.
+func WithBytesPool(bytesPool statute.BytesPool) ServerOption {
+	return func(s *Server) {
+		s.BytesPool = bytesPool
+	}
+}
+
+// handle processes the SOCKS4 request based on the command type.
 func (s *Server) handle(req *request) error {
 	switch req.Command {
 	case ConnectCommand:
@@ -162,6 +163,7 @@ func (s *Server) handle(req *request) error {
 	}
 }
 
+// handleConnect handles the SOCKS4 CONNECT command.
 func (s *Server) handleConnect(req *request) error {
 	if s.UserConnectHandle == nil {
 		return s.embedHandleConnect(req)
@@ -188,6 +190,7 @@ func (s *Server) handleConnect(req *request) error {
 	return s.UserConnectHandle(proxyReq)
 }
 
+// embedHandleConnect is the default handler for SOCKS4 CONNECT if UserConnectHandle is not set.
 func (s *Server) embedHandleConnect(req *request) error {
 	defer func() {
 		_ = req.Conn.Close()
@@ -223,6 +226,7 @@ func (s *Server) embedHandleConnect(req *request) error {
 	return statute.Tunnel(s.Context, target, req.Conn, buf1, buf2)
 }
 
+// sendReply sends the SOCKS4 reply to the client.
 func sendReply(w io.Writer, resp reply, addr *address) error {
 	_, err := w.Write([]byte{0, byte(resp)})
 	if err != nil {
@@ -232,6 +236,7 @@ func sendReply(w io.Writer, resp reply, addr *address) error {
 	return err
 }
 
+// request represents a SOCKS4 request.
 type request struct {
 	Version         uint8
 	Command         Command

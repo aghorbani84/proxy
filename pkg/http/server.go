@@ -10,22 +10,17 @@ import (
 	"strconv"
 )
 
+// Server represents an HTTP proxy server.
 type Server struct {
-	// bind is the address to listen on
-	Bind string
-	// ProxyDial specifies the optional proxyDial function for
-	// establishing the transport connection.
-	ProxyDial statute.ProxyDialFunc
-	// UserConnectHandle gives the user control to handle the TCP CONNECT requests
+	Bind              string
+	ProxyDial         statute.ProxyDialFunc
 	UserConnectHandle statute.UserConnectHandler
-	// Logger error log
-	Logger statute.Logger
-	// Context is default context
-	Context context.Context
-	// BytesPool getting and returning temporary bytes for use by io.CopyBuffer
-	BytesPool statute.BytesPool
+	Logger            statute.Logger
+	Context           context.Context
+	BytesPool         statute.BytesPool
 }
 
+// NewServer creates a new HTTP proxy server with the provided options.
 func NewServer(options ...ServerOption) *Server {
 	s := &Server{
 		Bind:      statute.DefaultBindAddress,
@@ -41,27 +36,23 @@ func NewServer(options ...ServerOption) *Server {
 	return s
 }
 
+// ServerOption is a function that configures the HTTP proxy server.
 type ServerOption func(*Server)
 
+// ListenAndServe starts the HTTP proxy server and listens for incoming connections.
 func (s *Server) ListenAndServe() error {
 	s.Logger.Debug("Serving on " + s.Bind + " ...")
-	// Create a new listener
+
 	ln, err := net.Listen("tcp", s.Bind)
 	if err != nil {
 		s.Logger.Error("Error listening on " + s.Bind + ", " + err.Error())
-		return err // Return error if binding was unsuccessful
+		return err
 	}
+	defer ln.Close()
 
-	// ensure listener will be closed
-	defer func() {
-		_ = ln.Close()
-	}()
-
-	// Create a cancelable context based on s.Context
 	ctx, cancel := context.WithCancel(s.Context)
-	defer cancel() // Ensure resources are cleaned up
+	defer cancel()
 
-	// Start to accept connections and serve them
 	for {
 		select {
 		case <-ctx.Done():
@@ -72,55 +63,59 @@ func (s *Server) ListenAndServe() error {
 				s.Logger.Error(err)
 				continue
 			}
-
-			// Start a new goroutine to handle each connection
-			// This way, the server can handle multiple connections concurrently
 			go func() {
 				err := s.ServeConn(conn)
 				if err != nil {
-					s.Logger.Error(err) // Log errors from ServeConn
+					s.Logger.Error(err)
 				}
 			}()
 		}
 	}
 }
 
+// WithLogger sets the logger for the HTTP proxy server.
 func WithLogger(logger statute.Logger) ServerOption {
 	return func(s *Server) {
 		s.Logger = logger
 	}
 }
 
+// WithBind sets the bind address for the HTTP proxy server.
 func WithBind(bindAddress string) ServerOption {
 	return func(s *Server) {
 		s.Bind = bindAddress
 	}
 }
 
+// WithConnectHandle sets the user-defined connection handler for the HTTP proxy server.
 func WithConnectHandle(handler statute.UserConnectHandler) ServerOption {
 	return func(s *Server) {
 		s.UserConnectHandle = handler
 	}
 }
 
+// WithProxyDial sets the proxy dial function for the HTTP proxy server.
 func WithProxyDial(proxyDial statute.ProxyDialFunc) ServerOption {
 	return func(s *Server) {
 		s.ProxyDial = proxyDial
 	}
 }
 
+// WithContext sets the context for the HTTP proxy server.
 func WithContext(ctx context.Context) ServerOption {
 	return func(s *Server) {
 		s.Context = ctx
 	}
 }
 
+// WithBytesPool sets the byte pool for the HTTP proxy server.
 func WithBytesPool(bytesPool statute.BytesPool) ServerOption {
 	return func(s *Server) {
 		s.BytesPool = bytesPool
 	}
 }
 
+// ServeConn handles an incoming connection to the HTTP proxy server.
 func (s *Server) ServeConn(conn net.Conn) error {
 	reader := bufio.NewReader(conn)
 	req, err := http.ReadRequest(reader)
@@ -131,6 +126,7 @@ func (s *Server) ServeConn(conn net.Conn) error {
 	return s.handleHTTP(conn, req, req.Method == http.MethodConnect)
 }
 
+// handleHTTP handles an HTTP request and invokes the user-defined connection handler.
 func (s *Server) handleHTTP(conn net.Conn, req *http.Request, isConnectMethod bool) error {
 	if s.UserConnectHandle == nil {
 		return s.embedHandleHTTP(conn, req, isConnectMethod)
@@ -153,17 +149,13 @@ func (s *Server) handleHTTP(conn net.Conn, req *http.Request, isConnectMethod bo
 	host, portStr, err := net.SplitHostPort(targetAddr)
 	if err != nil {
 		host = targetAddr
-		if req.URL.Scheme == "https" || isConnectMethod {
-			portStr = "443"
-		} else {
-			portStr = "80"
-		}
+		portStr = getPortForScheme(req.URL.Scheme, isConnectMethod)
 		targetAddr = net.JoinHostPort(host, portStr)
 	}
 
 	portInt, err := strconv.Atoi(portStr)
 	if err != nil {
-		return err // Handle the error if the port string is not a valid integer.
+		return err
 	}
 	port := int32(portInt)
 
@@ -180,20 +172,23 @@ func (s *Server) handleHTTP(conn net.Conn, req *http.Request, isConnectMethod bo
 	return s.UserConnectHandle(proxyReq)
 }
 
+// getPortForScheme returns the default port based on the scheme and whether it's a CONNECT method.
+func getPortForScheme(scheme string, isConnectMethod bool) string {
+	if scheme == "https" || isConnectMethod {
+		return "443"
+	}
+	return "80"
+}
+
+// embedHandleHTTP handles an HTTP request when no user-defined connection handler is provided.
 func (s *Server) embedHandleHTTP(conn net.Conn, req *http.Request, isConnectMethod bool) error {
-	defer func() {
-		_ = conn.Close()
-	}()
+	defer conn.Close()
 
 	targetAddr := req.URL.Host
 	host, portStr, err := net.SplitHostPort(targetAddr)
 	if err != nil {
 		host = targetAddr
-		if req.URL.Scheme == "https" || isConnectMethod {
-			portStr = "443"
-		} else {
-			portStr = "80"
-		}
+		portStr = getPortForScheme(req.URL.Scheme, isConnectMethod)
 		targetAddr = net.JoinHostPort(host, portStr)
 	}
 
@@ -206,9 +201,7 @@ func (s *Server) embedHandleHTTP(conn net.Conn, req *http.Request, isConnectMeth
 		)
 		return err
 	}
-	defer func() {
-		_ = target.Close()
-	}()
+	defer target.Close()
 
 	if isConnectMethod {
 		_, err = conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
